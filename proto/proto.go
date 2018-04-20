@@ -69,7 +69,8 @@ func headerIndex(payload []byte, name []byte) int {
 	i := 0
 
 	for {
-		if i >= len(payload) {
+		// we need enough space for at least a \n and the header name, better to rewite section below, not properly case insensitive?
+		if i >= (len(payload) - len(name) - 1) {
 			return -1
 		}
 
