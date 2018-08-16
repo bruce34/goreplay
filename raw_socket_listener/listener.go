@@ -802,12 +802,14 @@ func (t *Listener) processTCPPacket(packet *TCPPacket) {
 	message.AddPacket(packet)
 
 	// Handling Expect: 100-continue requests
-	if message.expectType == httpExpect100Continue && len(message.packets) == message.headerPacket+1 {
+	// NB The 100-Continue response can come at any point in the stream, just after the headers are sent,
+	// in the middle of sending a large POST or at the end, just before the actual response code (e.g. 201)
+	if message.expectType == httpExpect100Continue { //} && len(message.packets) == message.headerPacket+1 {
 		seq := packet.Seq + uint32(len(packet.Data))
 		t.seqWithData[seq] = packet.Ack
 
 		message.DataSeq = seq
-		message.complete = false
+//		message.complete = false
 
 		// In case if sequence packet came first
 		for _, m := range t.messages {
@@ -848,6 +850,13 @@ func (t *Listener) processTCPPacket(packet *TCPPacket) {
 		message.UpdateResponseAck()
 		t.respAliases[message.ResponseAck] = message
 	}
+
+	//log.Println("state ", isIncoming, message.Seq, message.DataSeq, message.complete, message.BodySize(), message.seqMissing, message.headerPacket, message.AssocMessage, message.bodyType, message.contentLength, message.BodySize(), len(message.packets), message.headerPacket )
+	if message.seqMissing {
+		message.checkSeqIntegrity()
+		//log.Println("again state ", isIncoming, message.Seq, message.DataSeq, message.complete, message.BodySize(), message.seqMissing, message.headerPacket, message.AssocMessage, message.bodyType, message.contentLength, message.BodySize(), len(message.packets) )
+	}
+
 
 	// If message contains only single packet immediately dispatch it
 	if message.complete {
