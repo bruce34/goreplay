@@ -353,9 +353,12 @@ func (t *Listener) readPcap() {
 
 			if it, err := net.InterfaceByName(device.Name); err == nil {
 				// Auto-guess max length of packet to capture
-				inactive.SetSnapLen(it.MTU + 68*2)
+//				inactive.SetSnapLen(it.MTU + 68*2)
+				log.Println("Setting snapLen by auto-guess ", strconv.Itoa(it.MTU + 68*2) + " overriding to 65536+68*2")
+				inactive.SetSnapLen(65536 + 68*2) // *64
 			} else {
-				inactive.SetSnapLen(65536)
+				log.Println("Setting snapLen to 64k")
+				inactive.SetSnapLen(65536 + 68*2) // *64
 			}
 
 			inactive.SetTimeout(t.messageExpire)
