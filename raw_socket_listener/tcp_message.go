@@ -103,29 +103,120 @@ func (t *TCPMessage) Size() (size int) {
 	return
 }
 
+// with netword card offloading, we can see a 16k packet (A) on an MTU of 1.5k, followed by a retransmission (B) of less than
+// 16k covering the same as the previous 16k. The assumption is we won't see a retransmission partially covering the
+// end of the 16k packet and going in to the next packet.
+func (t *TCPMessage) CoalescePackets(packets []*TCPPacket, debugPrint bool) (packetsCoalesced bool, pList []*TCPPacket){
+	pList = [](*TCPPacket){}
+	var prev *TCPPacket
+	for _, pkt := range packets {
+		if prev == nil {
+			pList = append(pList, pkt)
+			prev = pkt
+			continue
+		}
+		pktEnd := int(pkt.Seq) + len(pkt.Data)
+		prevEnd := int(prev.Seq) + len(prev.Data)
+		if debugPrint {
+			log.Println("prev: ", prev.Seq, "(", len(prev.Data),") -> ", prevEnd, " . pkt: ", pkt.Seq, "(", len(pkt.Data),") -> ", pktEnd)
+		}
+		// TODO not safe with tcp sequence number wrapping
+		// ----=prev=.==pkt===------ butt up against, or space between - let it pass
+		if (int(pkt.Seq) >= prevEnd) {
+			pList = append(pList, pkt)
+			prev = pkt
+			continue
+		}
+		// ----=prev====---
+		// -------=pkt=----
+		if (pkt.Seq >= prev.Seq) && (pktEnd <= prevEnd) {
+			// totally ignore it, don't add
+			packetsCoalesced = true
+//			log.Println("Coalesced - ignored, prev: ", prev.Seq, "(", len(prev.Data),")->", prevEnd, " . pkt: ", pkt.Seq, "(", len(pkt.Data),")->", pktEnd)
+			continue
+		}
+		// ----=prev=-------
+		// --====pkt====----
+		if (pkt.Seq <= prev.Seq) && (pktEnd >= prevEnd) {
+			// replace prev with pkt and carry on
+			pList = append(pList[:len(pList)-1], pkt)
+			prev = pkt
+			packetsCoalesced = true
+//			log.Println("Coalesced - replaced, prev: ", prev.Seq, "(", len(prev.Data),")->", prevEnd, " . pkt: ", pkt.Seq, "(", len(pkt.Data),")->", pktEnd)
+			continue
+		}
+		// partial overlap case, not handled for now
+		log.Println("Failed to coalesce packets with partial overlap, ignoring!: ", pkt.Seq, pktEnd, prev.Seq, prevEnd)
+		log.Println("prev: ", prev.Seq, "(", len(prev.Data),") -> ", prevEnd, " . pkt: ", pkt.Seq, "(", len(pkt.Data),") -> ", pktEnd)
+	}
+	if debugPrint {
+		prev = nil
+		for _, pkt := range pList {
+			pktEnd := int(pkt.Seq) + len(pkt.Data)
+			if prev != nil {
+				prevEnd := int(prev.Seq) + len(prev.Data)
+				same := " = "
+				if prevEnd > int(pkt.Seq) {
+					same = ">>>"
+				} else if prevEnd < int(pkt.Seq) {
+					same = "<<<"
+				}
+				log.Println("prev: ", prev.Seq, "(", len(prev.Data), ") -> ", prevEnd, same, "pkt: ", pkt.Seq, "(", len(pkt.Data), ") -> ", pktEnd)
+			}
+			prev = pkt
+		}
+	}
+	return packetsCoalesced, pList
+}
+
 // AddPacket to the message and ensure packet uniqueness
 // TCP allows that packet can be re-send multiple times
 func (t *TCPMessage) AddPacket(packet *TCPPacket) {
 	packetFound := false
 
 	for _, pkt := range t.packets {
-		if packet.Seq == pkt.Seq {
+		if packet.Seq == pkt.Seq && len(packet.Data) == len(pkt.Data) {
+			//log.Println("Already got: ", packet.Seq, " ", len(packet.Data))
 			packetFound = true
+			break
+		}
+		// ------====packet====--------
+		// ----===pkt============------ if entirely covered then already found
+		if (packet.Seq >= pkt.Seq) && (int(packet.Seq) + len(packet.Data) <= int(pkt.Seq) + len(pkt.Data)) {
+			packetFound = true
+			//log.Println("Ignoring: ", packet.Seq, " ", len(packet.Data) )
 			break
 		}
 	}
 
+	//if packetFound {
+	//	log.Println("Packet found")
+	//}
+	//
 	if !packetFound {
 		// Packets not always captured in same Seq order, and sometimes we need to prepend
 		if len(t.packets) == 0 || packet.Seq > t.packets[len(t.packets)-1].Seq {
-			t.packets = append(t.packets, packet)
+			//log.Println("Start or End")
+			if (len(t.packets) > 0) {
+				//log.Println("Adding seq: ", packet.Seq, "(", len(packet.Data),") to ", t.packets[len(t.packets)-1].Seq, " (", len(t.packets[len(t.packets)-1].Data), ")")
+			}
+			packetFound = true
+			_, t.packets = t.CoalescePackets(append(t.packets, packet), false)
+
 		} else if packet.Seq < t.packets[0].Seq {
+			//log.Println("Prepending seq at 0: ", packet.Seq, "(", len(packet.Data),") before ", t.packets[0].Seq)
 			t.packets = append([]*TCPPacket{packet}, t.packets...)
+			_, t.packets = t.CoalescePackets(t.packets, false)
 			t.Seq = packet.Seq // Message Seq should indicated starting seq
+			packetFound = true
 		} else { // insert somewhere in the middle...
+			//log.Println("Middle...")
 			for i, p := range t.packets {
-				if packet.Seq < p.Seq {
+				if packet.Seq <= p.Seq {
+					//log.Println("Prepending seq: ", packet.Seq, "(", len(packet.Data),") before ", p.Seq, " (", len(p.Data), ") ", i)
 					t.packets = append(t.packets[:i], append([]*TCPPacket{packet}, t.packets[i:]...)...)
+					_, t.packets = t.CoalescePackets(t.packets, false)
+					packetFound = true
 					break
 				}
 			}
@@ -142,9 +233,15 @@ func (t *TCPMessage) AddPacket(packet *TCPPacket) {
 			t.End = packet.timestamp
 		}
 	}
+	if !packetFound {
+		log.Println("** Failed to insert packet ", packet.Seq, "(", len(packet.Data))
+	}
+
+	//log.Println("Bodysize ", t.BodySize(), t.contentLength)
 
 	t.checkSeqIntegrity()
 	t.updateHeadersPacket()
+	//log.Println("HeadersPacket: ", t.seqMissing, t.headerPacket, len(t.packets))
 	t.updateMethodType()
 	t.updateBodyType()
 	t.checkIfComplete()
@@ -216,16 +313,16 @@ func (t *TCPMessage) updateHeadersPacket() {
 
 	for i, p := range t.packets {
 		if len(p.Data) >= len(bEmptyLine) {
-			if bytes.LastIndex(p.Data, bEmptyLine) != -1 {
-				t.headerPacket = i
-				return
-			}
+		if bytes.LastIndex(p.Data, bEmptyLine) != -1 {
+			t.headerPacket = i
+			return
+		}
 		} else if bytes.Equal(p.Data, bBR) {
 			if bytes.LastIndex(t.packets[i-1].Data, bBR) != -1 {
 				t.headerPacket = i
 				return
 			}
-		}
+	}
 	}
 
 	return
@@ -425,7 +522,8 @@ func (t *TCPMessage) check100Continue() {
 
 	last := t.packets[len(t.packets)-1]
 	// reading last 4 bytes for double CRLF
-	if !bytes.HasSuffix(last.Data, bEmptyLine) {
+	if bytes.LastIndex(last.Data, bEmptyLine) == -1 {
+		//log.Println("Failed to find headers")
 		return
 	}
 
