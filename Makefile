@@ -2,7 +2,7 @@ SOURCE = $(shell ls -1 *.go | grep -v _test.go)
 SOURCE_PATH = /go/src/github.com/buger/goreplay/
 PORT = 8000
 FADDR = :8000
-RUN = docker run -v `pwd`:$(SOURCE_PATH) -p 0.0.0.0:$(PORT):$(PORT) -i -t gor
+RUN = docker run -v `pwd`:$(SOURCE_PATH) -p 0.0.0.0:$(PORT):$(PORT) --sysctl net.ipv6.conf.all.disable_ipv6=0 -i -t gor
 BENCHMARK = BenchmarkRAWInput
 TEST = TestRawListenerBench
 VERSION = DEV-$(shell date +%s)
